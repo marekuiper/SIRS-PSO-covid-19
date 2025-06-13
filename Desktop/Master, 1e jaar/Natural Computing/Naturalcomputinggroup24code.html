@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SIR with Interventions</title>
+<style>
+body {
+  font-family: "HelveticaNeue-Light", "Helvetica Neue Light", "Helvetica Neue",
+    Helvetica, Arial, "Lucida Grande", sans-serif;
+  padding: 15px;
+  max-width: 600px;
+  margin: auto;
+}
+td {
+  padding: 10px;
+  vertical-align: top;
+}
+input[type="number"] {
+  width: 60px;
+}
+</style>
+<script src="./artistoo.js"></script>
+<script src="./fpsmeter.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+/* globals CPM, FPSMeter */
+
+let C, zoom = 2, Cim, w = 200, meter, t = 0;
+let conf = { RUNTIME: 100 };
+
+// Fixed recovery rate
+const r_r = 0.07;
+// Infection rate base
+const baseInfectionRate = 0.1;
+const vaccinationEfficacy = 0.7;  // 70% reduction in infection chance (adjust as needed)
+
+
+
+let totalInfected = 0;
+let peakInfected = 0;
+let totalRecovered = 0;
+let economicCost = 0;
+let totalVaccinated = 0;  
+
+const vaccinationCostPerPerson = 500;
+const infectionCostPerPerson = 3500;
+const hospitalizationCostPerPerson = 12000;
+const hospitalizationProbability = 0.05;
+const realLockdownMaxCost = 5_000_000_000;
+const scaleFactor = (w * w) / 331_000_000;
+const scaledMaxLockdownCost = realLockdownMaxCost * scaleFactor;
+const TOTAL_VACCINE_SUPPLY = 5000;
+
+let recoveryTracker = {}; // key: "x,y", value: days since recovery
+let wasVaccinatedBeforeInfection = {};
+
+
+
+let intervention = {
+  lockdownIntensity: 0.0,    // 0=no lockdown, 1=full lockdown
+  lockdownStart: 0,         // lockdown start day
+  lockdownDuration: 0,      // duration in days
+  vaccinationDay: 0,        // vaccination start day
+  dailyVaccinationCapacity: 0    // fraction vaccinated at vaccinationDay (0-1)
+};
+
+
+
+function logMessage(msg) {
+  const logDiv = document.getElementById("log");
+  logDiv.textContent += msg + "\n";
+  logDiv.scrollTop = logDiv.scrollHeight;  // auto scroll to bottom
+}
+
+function vaccinate(day) {
+  if (day >= intervention.vaccinationDay && totalVaccinated < TOTAL_VACCINE_SUPPLY) {
+    const totalPixels = w * w;
+    // Get array of all susceptible pixel coordinates
+    const susceptibles = [];
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        if (C.pixt([x, y]) === 0) {  // 0 = susceptible
+          susceptibles.push([x, y]);
+        }
+      }
+    }
+
+    // logMessage(`Total susceptibles before vaccination: ${susceptibles.length}`);
+
+    if (susceptibles.length === 0) {
+      // logMessage(`No susceptibles left to vaccinate at day ${day}`);
+      return;
+    }
+
+    // Shuffle susceptibles array (Fisher-Yates)
+    for (let i = susceptibles.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [susceptibles[i], susceptibles[j]] = [susceptibles[j], susceptibles[i]];
+    }
+
+    const remainingSupply = TOTAL_VACCINE_SUPPLY - totalVaccinated;
+    const actualVaccinateCount = Math.min(intervention.dailyVaccinationCapacity, remainingSupply, susceptibles.length);
+    
+    for (let i = 0; i < actualVaccinateCount; i++) {
+      const [x, y] = susceptibles[i];
+      C.setpix([x, y], 3); // Set to vaccinated
+    }
+
+    economicCost += actualVaccinateCount * vaccinationCostPerPerson;
+
+    totalVaccinated += actualVaccinateCount;
+    document.getElementById("vaccinatedCount").textContent = totalVaccinated;
+
+    // logMessage(`Vaccinated ${actualVaccinateCount} individuals at day ${day}`);
+  }
+}
+
+function draw() {
+  Cim.clear("FFFFFF");
+  Cim.drawCellsOfId(1, "AA0000");  // infected red
+  Cim.drawCellsOfId(2, "AAAAAA");  // recovered gray
+  Cim.drawCellsOfId(3, "0077FF");  // vaccinated susceptible blue
+}
+
+let running = 1;
+function toggleAnim() { 
+  running = 1 - running;
+  if (running === 1) {
+    run();
+  } 
+}
+
+function seedGrid() {
+  // Initial infection in the middle
+  C.setpix(C.midpoint, 1);
+}
+
+function initialize() {
+  t = 0;
+  recoveryTracker = {};
+  totalInfected = 0;
+  peakInfected = 0;
+  totalRecovered = 0;
+  economicCost = 0;
+  totalVaccinated = 0;  
+  document.getElementById("finalScore").textContent  = "0";
+  document.getElementById("vaccinatedCount").textContent = "0";
+  document.getElementById("dayCounter").textContent = t;
+  document.getElementById("totalInfected").textContent = totalInfected;
+  document.getElementById("peakInfected").textContent = peakInfected;
+  document.getElementById("totalRecovered").textContent = totalRecovered;
+  document.getElementById("economicCost").textContent = economicCost.toFixed(2);
+  
+
+
+  C = new CPM.CA([w, w], {
+    UPDATE_RULE: function(p, N) {
+      let state = this.pixt(p);
+      if (state === 0 || state === 3) { // susceptible or vaccinated susceptible
+        let infRate = getCurrentInfectionRate(t);
+        if (state === 3) {
+          // reduce infection rate for vaccinated susceptibles
+          infRate *= (1 - vaccinationEfficacy);
+        }
+        for (let pn of N) {
+          if (this.pixt(pn) === 1 && C.random() < infRate) {
+            const keyV = p.toString();
+            if (state == 3) {
+              wasVaccinatedBeforeInfection[keyV] = true
+            }
+            return 1; // infected
+          }
+        }
+      } else if (state === 1 && C.random() < r_r) {
+        return 2; // recovered
+      }
+      return state;
+
+    }
+  });
+
+  for (let i = 0; i < w*w; i++) {
+    C.setpix(i, 0);
+  }
+  seedGrid();
+
+  if (!Cim) {
+    Cim = new CPM.Canvas(C, { zoom: zoom });
+  } else {
+    Cim.C = C;
+  }
+  Cim.el.onclick = toggleAnim;
+
+  meter = new FPSMeter({ left: "auto", right: "5px" });
+  setInputValues(intervention);
+
+  running = 1;
+  run();
+}
+
+function output() {
+  let cellpixels = C.getStat(CPM.PixelsByCell);
+  for (let cid of Object.keys(cellpixels)) {
+    console.log(t + "\t" + cid + "\t" + cellpixels[cid].length);
+  }
+}
+
+
+
+
+let disableUI = false
+
+function step() {
+  if (running) {
+    if (!disableUI) {
+      meter.tickStart();
+    }
+
+    vaccinate(t);
+
+    // Snapshot old states before processing
+    C.oldpix = {};
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        C.oldpix[[x, y].toString()] = C.pixt([x, y]);
+      }
+    }
+
+    C.timeStep();
+
+    let newlySusceptible = [];
+
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        const key = [x, y].toString();
+        const state = C.pixt([x, y]);
+        const prevState = C.oldpix[key];
+
+        if (prevState === 1 && state === 2) {
+          recoveryTracker[key] = 0;
+        }
+
+        if (state === 2 && key in recoveryTracker) {
+          recoveryTracker[key]++;
+          const days = recoveryTracker[key];
+          if (days >= 90) {
+            newlySusceptible.push([x, y]);
+          } else if (Math.random() < days / 90) {
+            newlySusceptible.push([x, y]);
+          }
+        }
+      }
+    }
+
+    // Apply reversion
+    for (let [x, y] of newlySusceptible) {
+      const keyV = [x, y].toString();
+
+      wasVaccinatedBeforeInfection[keyV] = wasVaccinatedBeforeInfection[keyV] || false;
+
+      if (wasVaccinatedBeforeInfection[keyV]) {
+        C.setpix([x, y], 3);
+        delete wasVaccinatedBeforeInfection[keyV];
+        delete recoveryTracker[keyV]
+      } else {
+        C.setpix([x, y], 0);
+        delete recoveryTracker[keyV];
+      }
+      
+    }
+
+    // Count states
+    let infected = 0, newlyRecovered = 0, newInfections = 0;
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        const key = [x, y].toString();
+        const prevState = C.oldpix[key];
+        const state = C.pixt([x, y]);
+        if (state === 1) infected++;
+        if (prevState === 1 && state === 2) newlyRecovered++;
+        if (prevState === 0 && state === 1) newInfections++;
+      }
+    }
+
+    totalInfected = infected;
+    peakInfected = Math.max(peakInfected, infected);
+    totalRecovered += newlyRecovered;
+
+    // Update oldpix snapshot for next frame
+    C.oldpix = {};
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        C.oldpix[[x, y].toString()] = C.pixt([x, y]);
+      }
+    }
+
+    // Calculate costs
+    economicCost += newInfections * infectionCostPerPerson;
+    economicCost += newInfections * hospitalizationProbability * hospitalizationCostPerPerson;
+
+    if (t >= intervention.lockdownStart && t < intervention.lockdownStart + intervention.lockdownDuration) {
+      const lockdownCost = intervention.lockdownIntensity * scaledMaxLockdownCost;
+      economicCost += lockdownCost;
+    }
+
+    if (!disableUI) {
+      draw();
+      output();
+
+      document.getElementById("dayCounter").textContent = t;
+      document.getElementById("totalInfected").textContent = totalInfected;
+      document.getElementById("peakInfected").textContent = peakInfected;
+      document.getElementById("totalRecovered").textContent = totalRecovered;
+      document.getElementById("economicCost").textContent = economicCost.toFixed(2);
+
+      meter.tick();
+    }
+
+    t++;
+  }
+}
+
+
+
+function run() {
+  step();
+  if (t < conf.RUNTIME && running) {
+    if (!disableUI) {
+      setTimeout(run, 50);  // 200 ms delay between steps (adjust as needed)
+    } else {
+      run();
+    }
+    
+  }
+  else if (t >= conf.RUNTIME) {
+    const finalScore = (totalRecovered + totalVaccinated) - (economicCost / 1_000_000); 
+    if (!disableUI) {
+      document.getElementById("finalScore").textContent = finalScore.toFixed(2);
+    }
+    
+  }
+}
+
+function getCurrentInfectionRate(day) {
+  const lockdownActive =
+    day >= intervention.lockdownStart &&
+    day < intervention.lockdownStart + intervention.lockdownDuration;
+
+  let rate;
+  if (lockdownActive) {
+    rate = baseInfectionRate * (1 - intervention.lockdownIntensity);
+  } else {
+    rate = baseInfectionRate;
+  }
+  
+  // Update infection rate display on page
+  document.getElementById("infectionRate").textContent = rate.toFixed(3);
+  
+  return rate;
+}
+
+
+function updateIntervention() {
+  intervention.lockdownIntensity = parseFloat(document.getElementById("lockdownIntensity").value);
+  intervention.lockdownStart = parseInt(document.getElementById("lockdownStart").value);
+  intervention.lockdownDuration = parseInt(document.getElementById("lockdownDuration").value);
+  intervention.vaccinationDay = parseInt(document.getElementById("vaccinationDay").value);
+  intervention.dailyVaccinationCapacity = parseInt(document.getElementById("dailyVaccinationCapacity").value);
+  console.log("Updated intervention:", intervention);
+}
+
+function simulateWithParams(params) {
+  // Apply parameters to intervention
+  intervention.lockdownIntensity = params.lockdownIntensity;
+  intervention.lockdownStart = Math.floor(params.lockdownStart);
+  intervention.lockdownDuration = Math.floor(params.lockdownDuration);
+  intervention.vaccinationDay = Math.floor(params.vaccinationDay);
+  intervention.dailyVaccinationCapacity = Math.floor(params.dailyVaccinationCapacity)
+
+  // Initialize simulation state
+  initialize();
+
+  // Disable UI and animation
+  disableUI = true;
+  running = 1;
+
+  // Run simulation loop instantly (no delay)
+  while (t < conf.RUNTIME) {
+    step();
+  }
+
+  disableUI = false;
+  running = 0;
+
+  // Calculate final score
+  return (totalRecovered + totalVaccinated) - (economicCost / 1000000);
+}
+
+class Particle {
+  constructor() {
+    this.position = {
+      lockdownIntensity: Math.random(),
+      lockdownStart: Math.floor(Math.random() * conf.RUNTIME),
+      lockdownDuration: Math.floor(Math.random() * 100) + 1,
+      vaccinationDay: Math.floor(Math.random() * conf.RUNTIME),
+      dailyVaccinationCapacity: Math.floor(Math.random() * 500)
+    };
+    this.velocity = {
+      lockdownIntensity: 0,
+      lockdownStart: 0,
+      lockdownDuration: 0,
+      vaccinationDay: 0,
+      dailyVaccinationCapacity: 0,
+    };
+    this.bestPosition = {...this.position};
+    this.bestScore = -Infinity;
+  }
+}
+
+const paramBounds = {
+  lockdownIntensity: [0, 1],
+  lockdownStart: [0, conf.RUNTIME],
+  lockdownDuration: [1, 100],
+  vaccinationDay: [0, conf.RUNTIME],
+  dailyVaccinationCapacity: [1, 500],
+};
+
+let globalBestHistory = [];
+
+async function runPSO() {
+  const swarmSize = 20;
+  const maxIter = 20;
+  const w = 0.8; // inertia
+  const c1 = 1.0; // cognitive
+  const c2 = 1.0; // social
+
+  let swarm = [];
+  for (let i = 0; i < swarmSize; i++) {
+    swarm.push(new Particle());
+  }
+
+  let globalBestScore = -Infinity;
+  let globalBestPosition = null;
+
+  // Disable UI and animation while running PSO to speed it up
+  disableUI = true;
+  running = 0;
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    document.getElementById("psoStatus").textContent = `PSO running: Iteration ${iter + 1} of ${maxIter}`;
+    await new Promise(r => setTimeout(r, 100)); // allow UI update (important!)
+
+    for (let p of swarm) {
+      let score = simulateWithParams(p.position);
+
+      if (score > p.bestScore) {
+        p.bestScore = score;
+        p.bestPosition = {...p.position};
+      }
+      if (score > globalBestScore) {
+        globalBestScore = score;
+        globalBestPosition = {...p.position};
+      }
+    }
+
+    globalBestHistory.push({...globalBestPosition, score: globalBestScore});
+
+
+    for (let p of swarm) {
+      for (let key in p.position) {
+        const r1 = Math.random();
+        const r2 = Math.random();
+        p.velocity[key] = w * p.velocity[key]
+          + c1 * r1 * (p.bestPosition[key] - p.position[key])
+          + c2 * r2 * (globalBestPosition[key] - p.position[key]);
+
+        p.position[key] += p.velocity[key];
+
+        // if (["lockdownStart", "lockdownDuration", "vaccinationDay"].includes(key)) {
+        //   p.position[key] = Math.round(p.position[key]);
+        //   p.position[key] = Math.min(Math.max(p.position[key], paramBounds[key][0]), paramBounds[key][1]);
+        // } else {
+        //   p.position[key] = Math.min(Math.max(p.position[key], paramBounds[key][0]), paramBounds[key][1]);
+        // }
+
+        if (["lockdownStart", "lockdownDuration", "vaccinationDay"].includes(key)) {
+          p.position[key] = Math.round(p.position[key]);
+        }
+        p.position[key] = Math.min(Math.max(p.position[key], paramBounds[key][0]), paramBounds[key][1]);
+      
+      }
+    }
+  }
+
+  drawPSOChart();
+
+  document.getElementById("psoStatus").textContent = `PSO complete! Best score: ${globalBestScore.toFixed(2)}`;
+
+  // console.log("---- PSO Optimal Parameters ----");
+  // for (const [key, value] of Object.entries(globalBestPosition)) {
+  //   console.log(`${key}: ${value}`);
+  // }
+  // console.log("------------------------------");
+
+  setInputValues(globalBestPosition);
+  document.getElementById("finalScore").textContent = globalBestScore.toFixed(2);
+
+  Object.assign(intervention, globalBestPosition);
+  initialize();
+  running = 1;
+  disableUI = false;
+  run();
+
+}
+
+
+
+// Optional helper function
+function setInputValues(params) {
+  document.getElementById("lockdownIntensity").value = params.lockdownIntensity.toFixed(2);
+  document.getElementById("lockdownStart").value = params.lockdownStart;
+  document.getElementById("lockdownDuration").value = params.lockdownDuration;
+  document.getElementById("vaccinationDay").value = params.vaccinationDay;
+  document.getElementById("dailyVaccinationCapacity").value = params.dailyVaccinationCapacity;
+
+}
+
+function drawPSOChart() {
+  const labels = globalBestHistory.map((_, i) => `Iter ${i + 1}`);
+
+  const chartConfigs = [
+    { id: 'chartScore', label: 'Score', key: 'score', color: 'black' },
+    { id: 'chartLockdownIntensity', label: 'Lockdown Intensity', key: 'lockdownIntensity' },
+    { id: 'chartLockdownStart', label: 'Lockdown Start', key: 'lockdownStart' },
+    { id: 'chartLockdownDuration', label: 'Lockdown Duration', key: 'lockdownDuration' },
+    { id: 'chartVaccinationDay', label: 'Vaccination Day', key: 'vaccinationDay' },
+    { id: 'chartDailyVaccinationCapacity', label: 'Daily Vaccination Capacity', key: 'dailyVaccinationCapacity' },
+  ];
+
+  chartConfigs.forEach(cfg => {
+    const ctx = document.getElementById(cfg.id).getContext('2d');
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: cfg.label,
+          data: globalBestHistory.map(h => h[cfg.key]),
+          borderColor: cfg.color || getRandomColor(),
+          fill: false,
+          tension: 0.3
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: true, position: 'bottom' }
+        },
+        scales: {
+          y: {
+            beginAtZero: false,
+            title: { display: true, text: cfg.label }
+          },
+          x: {
+            title: { display: true, text: 'Iteration' }
+          }
+        }
+      }
+    });
+  });
+}
+
+
+function getRandomColor() {
+  return `hsl(${Math.floor(Math.random() * 360)}, 70%, 50%)`;
+}
+
+
+
+</script>
+</head>
+<body onload="initialize()">
+
+<!-- <div id="log" style="white-space: pre-line; background: #eee; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; margin-top: 20px;"></div> -->
+
+
+<h1>SIR Model with Interventions</h1>
+<p>Susceptible-Infected-Recovered (SIR) model with lockdown and vaccination strategies.</p>
+<p>Click on the canvas to pause/resume simulation.</p>
+
+<p>Base infection rate: <strong>0.1</strong></p>
+<p>Recovery rate: <strong>0.01</strong></p>
+
+<h2>Intervention Parameters</h2>
+<p>
+  Lockdown intensity (0 to 1): <input id="lockdownIntensity" type="number" min="0" max="1" step="0.1" value="0" />
+</p>
+<p>
+  Lockdown start day: <input id="lockdownStart" type="number" min="0" value="0" />
+</p>
+<p>
+  Lockdown duration (days): <input id="lockdownDuration" type="number" min="1" value="0" />
+</p>
+<p>
+  Vaccination day: <input id="vaccinationDay" type="number" min="0" value="0" />
+</p>
+<p>
+  Daily vaccination capacity: <input id="dailyVaccinationCapacity" type="number" min="0" max="500" value="0" />
+</p>
+<p>Day: <span id="dayCounter">0</span></p>
+<p>Infection rate: <span id="infectionRate">0.1</span></p>
+<h2>Simulation Stats</h2>
+<h2>PSO Progress Charts</h2>
+<canvas id="chartScore" width="400" height="200"></canvas>
+<canvas id="chartLockdownIntensity" width="400" height="200"></canvas>
+<canvas id="chartLockdownStart" width="400" height="200"></canvas>
+<canvas id="chartLockdownDuration" width="400" height="200"></canvas>
+<canvas id="chartVaccinationDay" width="400" height="200"></canvas>
+<canvas id="chartDailyVaccinationCapacity" width="400" height="200"></canvas>
+<p>Current Infected: <span id="totalInfected">0</span></p>
+<p>Peak Infected: <span id="peakInfected">0</span></p>
+<p>Total Recovered: <span id="totalRecovered">0</span></p>
+<p>Economic Cost: <span id="economicCost">0</span></p>
+<p>Vaccinated: <span id="vaccinatedCount">0</span></p>
+<p><strong>Final Score:</strong> <span id="finalScore">0</span></p>
+
+
+
+
+
+
+<button onclick="updateIntervention()">Update Interventions</button>
+<button onclick="runPSO()">Run PSO to find optimal parameters</button>
+
+<p><button onclick="initialize()">Reset</button></p>
+
+<p><strong>PSO Status:</strong> <span id="psoStatus">Not started</span></p>
+
+</body>
+</html>
+
